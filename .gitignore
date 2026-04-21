@@ -1,0 +1,43 @@
+# Python
+__pycache__/
+*.py[cod]
+*.pyo
+*.egg-info/
+.eggs/
+dist/
+build/
+*.egg
+
+# Virtual environments
+.venv/
+venv/
+env/
+
+# Jupyter checkpoints
+.ipynb_checkpoints/
+
+# Results & large outputs (track structure, not big files)
+results/figures/*.html
+results/figures/*.png
+results/tables/*.csv
+results/videos/
+*.ply
+*.zip
+
+# Datasets (large; download separately)
+datasets/euroc/
+datasets/custom/
+datasets/synthetic/
+
+# VGGT model checkpoint (large binary)
+checkpoints/
+
+# Temporary VGGT source clones used during development
+tmp_vggt_inspect/
+vggt_tmp/
+
+# Misc
+tmp_file.py
+.DS_Store
+Thumbs.db
+*.log
