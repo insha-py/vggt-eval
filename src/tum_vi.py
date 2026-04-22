@@ -278,11 +278,6 @@ class TUMVIDataset:
         print(f"[TUM-VI]   Found {len(members)} file entries in scanned chunks.")
 
         # ---- Identify what we need ------------------------------------
-        def _rel(name: str) -> str:
-            """Strip the top-level archive directory prefix."""
-            parts = name.lstrip("/").split("/")
-            return "/".join(parts[1:]) if len(parts) > 1 else name
-
         images = sorted(
             [(name, off, sz) for name, (off, sz) in members.items()
              if "cam0/data/" in name and name.endswith(".png")],
@@ -291,7 +286,7 @@ class TUMVIDataset:
 
         csvs = [
             (name, off, sz) for name, (off, sz) in members.items()
-            if any(_rel(name).endswith(c) for c in _REQUIRED_CSVS)
+            if self._output_path(name) in (self.cam0_csv, self.imu_csv, self.mocap_csv)
         ]
 
         if not images:
@@ -299,19 +294,22 @@ class TUMVIDataset:
                   "try increasing _SCAN_CHUNK_MB.")
             return False
         if len(csvs) < 3:
-            print(f"[TUM-VI]   Only {len(csvs)}/3 CSVs found. "
-                  f"Missing: "
-                  + str(_REQUIRED_CSVS - {_rel(n) for n, *_ in csvs}))
+            missing = {self.cam0_csv, self.imu_csv, self.mocap_csv} - {
+                self._output_path(n) for n, *_ in csvs
+            }
+            print(f"[TUM-VI]   Only {len(csvs)}/3 CSVs found. Missing: {missing}")
             return False
 
-        # ---- Download each file --------------------------------------
-        needed       = csvs + images
-        total_bytes  = sum(sz for _, _, sz in needed)
+        # ---- Download each file with canonical output path -----------
+        needed      = csvs + images
+        total_bytes = sum(sz for _, _, sz in needed)
         print(f"[TUM-VI]   Downloading {len(needed)} files "
               f"({total_bytes / 1024**2:.1f} MB) …")
 
         for i, (name, offset, size) in enumerate(needed):
-            out = self.download_dir / f"dataset-{self.sequence}_512_16" / _rel(name)
+            out = self._output_path(name)
+            if out is None:
+                continue
             out.parent.mkdir(parents=True, exist_ok=True)
 
             if out.exists() and out.stat().st_size == size:
@@ -336,29 +334,26 @@ class TUMVIDataset:
         images_saved = 0
         csvs_saved: set = set()
 
-        def _rel(name: str) -> str:
-            parts = name.lstrip("/").split("/")
-            return "/".join(parts[1:]) if len(parts) > 1 else name
-
         try:
             with urllib.request.urlopen(self._url, timeout=180) as resp:
                 with tarfile.open(fileobj=resp, mode="r|") as tf:
                     for member in tf:
-                        rel = _rel(member.name)
-                        is_csv = any(rel.endswith(c) for c in _REQUIRED_CSVS)
-                        is_img = ("cam0/data/" in rel and rel.endswith(".png")
+                        out = self._output_path(member.name)
+                        if out is None:
+                            continue
+                        is_img = (out.parent == self.cam0_dir
                                   and images_saved < self.n_frames)
-                        if is_csv or is_img:
-                            out = (self.download_dir
-                                   / f"dataset-{self.sequence}_512_16" / rel)
-                            out.parent.mkdir(parents=True, exist_ok=True)
-                            fobj = tf.extractfile(member)
-                            if fobj:
-                                out.write_bytes(fobj.read())
-                            if is_img:
-                                images_saved += 1
-                            if is_csv:
-                                csvs_saved.add(rel)
+                        is_csv = out in (self.cam0_csv, self.imu_csv, self.mocap_csv)
+                        if not (is_img or is_csv):
+                            continue
+                        out.parent.mkdir(parents=True, exist_ok=True)
+                        fobj = tf.extractfile(member)
+                        if fobj:
+                            out.write_bytes(fobj.read())
+                        if is_img:
+                            images_saved += 1
+                        if is_csv:
+                            csvs_saved.add(str(out))
                         print(f"\r[TUM-VI]   images={images_saved}/{self.n_frames}"
                               f"  csvs={len(csvs_saved)}/3",
                               end="", flush=True)
@@ -370,6 +365,29 @@ class TUMVIDataset:
                 print(f"\n[TUM-VI] Stream done ({e}).")
             elif images_saved == 0:
                 raise
+
+    # ------------------------------------------------------------------
+    def _output_path(self, tar_name: str) -> Optional[Path]:
+        """
+        Map a tar member name to its fixed on-disk output path.
+
+        This is intentionally independent of how many prefix components the
+        tar uses (dataset-room1_512_16/mav0/... vs mav0/... vs plain paths).
+        We match on the *suffix* of the member name and return the canonical
+        path relative to self._root.
+
+        Returns None if this member is not one we want to save.
+        """
+        n = tar_name.replace("\\", "/").lstrip("./")
+        if n.endswith("cam0/data.csv"):
+            return self.cam0_csv
+        if n.endswith("imu0/data.csv"):
+            return self.imu_csv
+        if n.endswith("mocap0/data.csv"):
+            return self.mocap_csv
+        if "cam0/data/" in n and n.endswith(".png"):
+            return self.cam0_dir / Path(n).name
+        return None
 
     # ------------------------------------------------------------------
     def _select_frame_indices(self, total: int) -> List[int]:
