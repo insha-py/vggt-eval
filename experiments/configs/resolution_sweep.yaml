@@ -1,0 +1,33 @@
+# Resolution Sensitivity Sweep — Phase 5
+# Run via: notebooks/04_resolution_sensitivity.ipynb
+
+experiment: resolution_sweep
+description: >
+  Evaluate VGGT pose accuracy and depth quality at 6 input resolutions
+  (224–518 px) on the TUM-VI room1 sequence.
+
+dataset:
+  name: TUM-VI
+  sequence: room1
+  n_frames: 40
+  download_dir: /tmp/tumvi
+
+model:
+  checkpoint: null           # null = auto-download from HuggingFace
+  device: cuda               # cuda | cpu
+  dtype: auto                # auto = bfloat16 on Ampere+, float16 otherwise
+
+sweep:
+  resolutions: [224, 280, 336, 392, 448, 518]
+  conf_thresh: 5.0
+  store_extrinsics: true
+
+evaluation:
+  align: true
+  with_scale: true
+  metrics: [ate, rpe, rotation_error, time, peak_memory, depth_confidence]
+
+output:
+  results_dir: results/
+  csv_name: phase5_resolution_sweep_room1.csv
+  figures_dir: results/figures/

@@ -1,0 +1,46 @@
+# Adaptive & Progressive Resolution — Phase 6
+# Run via: notebooks/05_adaptive_resolution.ipynb
+
+experiment: adaptive_resolution
+description: >
+  Compare baseline 224/518 px inference with two improvement strategies:
+  (1) Adaptive Resolution — low-res global + high-res uncertain patches;
+  (2) Progressive Refinement — coarse-to-fine pyramid depth blending.
+
+dataset:
+  name: TUM-VI
+  sequence: room1
+  n_frames: 40
+  download_dir: /tmp/tumvi
+
+model:
+  checkpoint: null
+  device: cuda
+  dtype: auto
+
+baselines:
+  - resolution: 224
+    label: "224 px (low)"
+  - resolution: 518
+    label: "518 px (high)"
+
+adaptive:
+  global_res: 224
+  patch_res: 518
+  conf_threshold: 0.3
+  patch_size_px: 64
+  max_patches: 4
+
+progressive:
+  pyramid: [224, 336, 518]
+  blend_mode: conf_weighted    # conf_weighted | max_conf
+
+evaluation:
+  align: true
+  with_scale: true
+  metrics: [ate, rpe, rotation_error, time, peak_memory, depth_confidence]
+
+output:
+  results_dir: results/
+  csv_name: phase6_improvements_room1.csv
+  figures_dir: results/figures/
