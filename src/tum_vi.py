@@ -32,7 +32,6 @@ import numpy as np
 from src.imu import (
     IMUCalibration,
     parse_imu_csv,
-    parse_image_timestamps_csv,
     parse_groundtruth_csv,
     interpolate_groundtruth,
 )
@@ -251,29 +250,41 @@ class TUMVIDataset:
     # ------------------------------------------------------------------
     def _download_two_chunk(self, total_size: int) -> bool:
         """
-        Fetch first 16 MB + last 16 MB, scan both for tar headers,
-        then pull only the files we need.
+        Scan the archive in up to 5 evenly-spaced 16 MB windows, then fetch
+        only the files we need.
+
+        Why multiple windows: the TUM VI room archives are ordered as
+        cam0 (~500 MB) → cam1 (~500 MB) → imu0/mocap0 (~4 MB) → events0
+        (~600 MB).  The CSVs sit at ~1000 MB, which is neither the start
+        nor the end, so two-window (start + end) misses them.
         """
         chunk_b = self._SCAN_CHUNK_MB * 1024 * 1024
 
-        print(f"[TUM-VI] Scanning archive "
-              f"({total_size / 1024**2:.0f} MB) with two {self._SCAN_CHUNK_MB} MB chunks …")
+        # Evenly space 5 scan windows across the archive.
+        # Round each start down to the nearest 512-byte boundary.
+        n_windows  = 5
+        offsets    = [
+            int(total_size * i / (n_windows - 1) / 512) * 512
+            for i in range(n_windows)
+        ]
+        # Clamp last window so it doesn't overshoot
+        offsets[-1] = max(0, total_size - chunk_b)
 
-        # ---- Fetch and scan first chunk (images live here) ------------
-        first_end   = min(chunk_b, total_size) - 1
-        print(f"[TUM-VI]   Fetching first {first_end/1024**2:.0f} MB …", end=" ", flush=True)
-        first_chunk = _http_range(self._url, 0, first_end)
-        print("done")
-        members = _scan_chunk(first_chunk, 0)
+        print(f"[TUM-VI] Scanning {total_size / 1024**2:.0f} MB archive "
+              f"with {n_windows} × {self._SCAN_CHUNK_MB} MB windows …")
 
-        # ---- Fetch and scan last chunk (CSVs live here) ---------------
-        last_start  = max(chunk_b, total_size - chunk_b)
-        if last_start < total_size:
-            print(f"[TUM-VI]   Fetching last {(total_size - last_start)/1024**2:.0f} MB …",
+        members: Dict[str, Tuple[int, int]] = {}
+        for idx, start in enumerate(offsets):
+            end = min(start + chunk_b, total_size) - 1
+            if end <= start:
+                continue
+            print(f"[TUM-VI]   Window {idx+1}/{n_windows}  "
+                  f"[{start//1024**2}–{end//1024**2} MB] …",
                   end=" ", flush=True)
-            last_chunk = _http_range(self._url, last_start, total_size - 1)
-            print("done")
-            members.update(_scan_chunk(last_chunk, last_start))
+            chunk = _http_range(self._url, start, end)
+            found = _scan_chunk(chunk, start)
+            members.update(found)
+            print(f"{len(found)} entries")
 
         print(f"[TUM-VI]   Found {len(members)} file entries in scanned chunks.")
 
@@ -414,22 +425,23 @@ class TUMVIDataset:
         from torchvision import transforms as TF
 
         # ---- timestamps + paths --------------------------------------
-        all_ts    = parse_image_timestamps_csv(str(self.cam0_csv))
+        # Derive timestamps directly from PNG filenames (stem = ns timestamp).
+        # Avoids float64 round-trip loss: TUM VI stems are ~1.5e18 ns (19
+        # significant digits), which float64 cannot represent exactly.
         all_paths = sorted(self.cam0_dir.glob("*.png"), key=lambda p: p.name)
-
-        img_map = {p.stem: str(p) for p in all_paths}
-        ts_path_pairs = sorted(
-            [(ts, img_map[str(int(round(ts * 1e9)))])
-             for ts in all_ts
-             if str(int(round(ts * 1e9))) in img_map],
-            key=lambda x: x[0],
-        )
+        ts_path_pairs = []
+        for p in all_paths:
+            try:
+                ts_ns = int(p.stem)           # exact integer, no precision loss
+                ts_path_pairs.append((ts_ns * 1e-9, str(p)))
+            except ValueError:
+                pass
 
         total = len(ts_path_pairs)
         if total == 0:
             raise RuntimeError(
                 f"No images found in {self.cam0_dir}. "
-                "Re-run download()."
+                "Re-run download() to fetch images."
             )
 
         sel          = [ts_path_pairs[i] for i in self._select_frame_indices(total)]
