@@ -291,17 +291,12 @@ class TUMVIDataset:
             key=lambda x: x[0],
         )
 
+        # Match CSVs regardless of how many prefix components were stripped.
+        # endswith() handles both "mav0/cam0/data.csv" and "cam0/data.csv".
         csv_entries = [
             (rel_path(n), off, sz) for n, (off, sz) in index.items()
-            if any(rel_path(n) == f"mav0/{c}" for c in _REQUIRED_CSVS)
+            if any(rel_path(n).endswith(c) for c in _REQUIRED_CSVS)
         ]
-
-        if not csv_entries:
-            # Try without the mav0/ prefix (some archives are laid out differently)
-            csv_entries = [
-                (rel_path(n), off, sz) for n, (off, sz) in index.items()
-                if any(rel_path(n).endswith(c) for c in _REQUIRED_CSVS)
-            ]
 
         selected_images = image_entries[: self.n_frames]
 
@@ -373,13 +368,15 @@ class TUMVIDataset:
                                   and images_saved < self.n_frames)
 
                         if is_csv or is_img:
+                            # rel has the top-level dir stripped, so the
+                            # correct output path is download_dir/dataset-xxx/rel
                             out = (self.download_dir
                                    / f"dataset-{self.sequence}_512_16"
                                    / rel)
                             out.parent.mkdir(parents=True, exist_ok=True)
-                            tf.extract(member,
-                                       self.download_dir
-                                       / f"dataset-{self.sequence}_512_16")
+                            fobj = tf.extractfile(member)
+                            if fobj:
+                                out.write_bytes(fobj.read())
                             if is_img:
                                 images_saved += 1
                             if is_csv:
