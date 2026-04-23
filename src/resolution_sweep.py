@@ -145,12 +145,15 @@ class ResolutionSweeper:
         if not paths:
             raise ValueError(f"No images found in {image_dir}")
 
+        import gc
+        import torch
+
         results: List[ResolutionResult] = []
 
         for res in self.resolutions:
             print(f"[ResolutionSweeper] resolution={res}px  ({len(paths)} frames)")
 
-            # Reload images at this resolution
+            # Load images at this resolution
             imgs, _, _ = load_images_from_dir(
                 image_dir, target_size=res, max_frames=max_frames
             )
@@ -160,15 +163,22 @@ class ResolutionSweeper:
                     self._model, imgs, self._device, self._dtype, resolution=res
                 )
 
-            ext  = out["extrinsic"]    # (N, 3, 4)
-            conf = out["depth_conf"]   # (N, H, W)
+            # Extract only what we need as numpy, then free everything else
+            ext  = out["extrinsic"]               # (N, 3, 4) numpy
+            conf = out["depth_conf"]              # (N, H, W) numpy
+            conf_mean = float(np.mean(conf))
+
+            del imgs, out, conf
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
             rr = ResolutionResult(
                 resolution      = res,
                 n_frames        = len(ext),
                 time_s          = tmr.elapsed,
                 peak_mb         = mem.peak_mb,
-                depth_conf_mean = float(np.mean(conf)),
+                depth_conf_mean = conf_mean,
             )
 
             if self.store_extrinsics:
@@ -193,13 +203,6 @@ class ResolutionSweeper:
                 f"  time={rr.time_s:.1f}s  peak={rr.peak_mb:.0f}MB"
                 + (f"  ATE={rr.ate_mean:.4f}" if gt_extrinsics is not None else "")
             )
-
-            # Free GPU memory before next run
-            try:
-                import torch
-                torch.cuda.empty_cache()
-            except Exception:
-                pass
 
         return results
 
