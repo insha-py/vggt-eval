@@ -474,6 +474,7 @@ class TUMVIDataset:
         calib   = IMUCalibration(R_cam_imu=_R_CAM_IMU)
 
         return dict(
+            image_dir        = str(self.cam0_dir),
             images_np        = images_np,
             image_paths      = image_paths,
             image_timestamps = image_timestamps,
