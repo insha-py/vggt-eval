@@ -250,43 +250,66 @@ class TUMVIDataset:
     # ------------------------------------------------------------------
     def _download_two_chunk(self, total_size: int) -> bool:
         """
-        Scan the archive in up to 5 evenly-spaced 16 MB windows, then fetch
-        only the files we need.
+        Two-phase targeted scan:
 
-        Why multiple windows: the TUM VI room archives are ordered as
-        cam0 (~500 MB) → cam1 (~500 MB) → imu0/mocap0 (~4 MB) → events0
-        (~600 MB).  The CSVs sit at ~1000 MB, which is neither the start
-        nor the end, so two-window (start + end) misses them.
+        Phase 1 — start window (0–16 MB):
+            Always contains cam0 images and cam0/data.csv.
+
+        Phase 2 — CSV search (58–70% of archive, 16 MB steps):
+            TUM-VI archives are ordered cam0 (~500 MB) → cam1 (~500 MB)
+            → imu0/data.csv + mocap0/data.csv (~1 MB) → events0 (~600 MB).
+            For a 1628 MB archive the CSVs sit at ~1000 MB (≈ 61%).
+            We scan 16 MB windows stepping through 58–70% until both
+            missing CSVs are found.  Worst case: 8 extra windows (128 MB)
+            instead of downloading the full archive.
         """
         chunk_b = self._SCAN_CHUNK_MB * 1024 * 1024
-
-        # Evenly space 5 scan windows across the archive.
-        # Round each start down to the nearest 512-byte boundary.
-        n_windows  = 5
-        offsets    = [
-            int(total_size * i / (n_windows - 1) / 512) * 512
-            for i in range(n_windows)
-        ]
-        # Clamp last window so it doesn't overshoot
-        offsets[-1] = max(0, total_size - chunk_b)
-
-        print(f"[TUM-VI] Scanning {total_size / 1024**2:.0f} MB archive "
-              f"with {n_windows} × {self._SCAN_CHUNK_MB} MB windows …")
-
         members: Dict[str, Tuple[int, int]] = {}
-        for idx, start in enumerate(offsets):
+
+        def _scan_window(start: int, label: str) -> None:
             end = min(start + chunk_b, total_size) - 1
             if end <= start:
-                continue
-            print(f"[TUM-VI]   Window {idx+1}/{n_windows}  "
-                  f"[{start//1024**2}–{end//1024**2} MB] …",
+                return
+            print(f"[TUM-VI]   {label}  [{start//1024**2}–{end//1024**2} MB] …",
                   end=" ", flush=True)
             chunk = _http_range(self._url, start, end)
             found = _scan_chunk(chunk, start)
             members.update(found)
             print(f"{len(found)} entries")
 
-        print(f"[TUM-VI]   Found {len(members)} file entries in scanned chunks.")
+        # ── Phase 1: start of archive ─────────────────────────────────
+        print(f"[TUM-VI] Scanning {total_size / 1024**2:.0f} MB archive …")
+        _scan_window(0, "Phase 1 (start)")
+
+        images_found = [
+            (n, o, s) for n, (o, s) in members.items()
+            if "cam0/data/" in n and n.endswith(".png")
+        ]
+        if not images_found:
+            print("[TUM-VI]   No cam0 images in first 16 MB — unexpected layout.")
+            return False
+
+        # ── Phase 2: targeted CSV search around 58–70% ───────────────
+        need_csvs = {self.imu_csv, self.mocap_csv} - {
+            self._output_path(n) for n in members
+        }
+        if need_csvs:
+            print(f"[TUM-VI]   CSVs missing: {[p.name for p in need_csvs]}. "
+                  f"Searching 58–70% of archive …")
+            # Step through 16 MB windows; stop as soon as all CSVs found.
+            start_frac, end_frac, step = 0.58, 0.70, chunk_b
+            offset = int(total_size * start_frac / 512) * 512
+            limit  = int(total_size * end_frac)
+            win_idx = 1
+            while offset < limit and need_csvs:
+                _scan_window(offset, f"Phase 2 win {win_idx}")
+                need_csvs = {self.imu_csv, self.mocap_csv} - {
+                    self._output_path(n) for n in members
+                }
+                offset += step
+                win_idx += 1
+
+        print(f"[TUM-VI]   Found {len(members)} entries total.")
 
         # ---- Identify what we need ------------------------------------
         images = sorted(
