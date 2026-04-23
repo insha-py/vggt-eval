@@ -491,6 +491,18 @@ class TUMVIDataset:
                                                    image_timestamps)
         print(f"[TUM-VI] GT: {len(gt_ts)} poses")
 
+        # Transform GT from IMU/body frame to camera frame.
+        # interpolate_groundtruth returns T_bw (body-from-world) extrinsics.
+        # VGGT outputs T_cw (camera-from-world).  The two differ by R_CAM_IMU:
+        #   R_cw = R_cam_imu @ R_bw
+        #   t_cw = R_cam_imu @ t_bw   (translation transforms the same way)
+        # _R_CAM_IMU ≈ R_z(-90°), which is why uncorrected rotation errors are ~90°.
+        R_ci = _R_CAM_IMU
+        R_bw = gt_extrinsics[:, :3, :3].copy()   # (N, 3, 3)
+        t_bw = gt_extrinsics[:, :3,  3].copy()   # (N, 3)
+        gt_extrinsics[:, :3, :3] = np.einsum("ij,njk->nik", R_ci, R_bw)
+        gt_extrinsics[:, :3,  3] = np.einsum("ij,nj->ni",  R_ci, t_bw)
+
         prefix  = ("room"     if self.sequence.startswith("room")     else
                    "corridor" if self.sequence.startswith("corridor") else
                    "slides")

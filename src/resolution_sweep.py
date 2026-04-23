@@ -29,6 +29,9 @@ import numpy as np
 # Default resolution ladder (pixels, square)
 DEFAULT_RESOLUTIONS = [224, 280, 336, 392, 448, 518]
 
+# Extended ladder — 168 px is the paper's minimum (DINO 14-px patch floor)
+EXTENDED_RESOLUTIONS = [168, 224, 280, 336, 392, 448, 518]
+
 
 # ---------------------------------------------------------------------------
 # Result dataclass
@@ -48,6 +51,7 @@ class ResolutionResult:
     n_frames:   int   = 0
     extrinsics: Optional[np.ndarray] = field(default=None, repr=False)
     depth_conf_mean: float = float("nan")  # mean depth confidence
+    scale_factor:   float = float("nan")   # Umeyama s: VGGT units → GT metric units
 
 
 # ---------------------------------------------------------------------------
@@ -208,17 +212,19 @@ class ResolutionSweeper:
                 rpe = compute_rpe(ext, gt, step=1)
                 rot = compute_rotation_errors(ext, gt)
 
-                rr.ate_mean   = ate["mean"]
-                rr.ate_rmse   = ate["rmse"]
-                rr.ate_median = ate["median"]
-                rr.rpe_trans  = rpe["trans_mean"]
-                rr.rpe_rot    = rpe["rot_mean"]
-                rr.rot_mean   = rot["mean"]
+                rr.ate_mean     = ate["mean"]
+                rr.ate_rmse     = ate["rmse"]
+                rr.ate_median   = ate["median"]
+                rr.rpe_trans    = rpe["trans_mean"]
+                rr.rpe_rot      = rpe["rot_mean"]
+                rr.rot_mean     = rot["mean"]
+                rr.scale_factor = ate["scale"]
 
             results.append(rr)
             print(
                 f"  time={rr.time_s:.1f}s  peak={rr.peak_mb:.0f}MB"
-                + (f"  ATE={rr.ate_mean:.4f}" if gt_extrinsics is not None else "")
+                + (f"  ATE={rr.ate_mean:.4f}  scale={rr.scale_factor:.3f}"
+                   if gt_extrinsics is not None else "")
             )
 
         return results
@@ -357,6 +363,7 @@ class ResolutionSweeper:
                 "rpe_trans":        r.rpe_trans,
                 "rpe_rot":          r.rpe_rot,
                 "rot_mean_deg":     r.rot_mean,
+                "scale_factor":     r.scale_factor,
                 "time_s":           r.time_s,
                 "peak_mb":          r.peak_mb,
                 "n_frames":         r.n_frames,

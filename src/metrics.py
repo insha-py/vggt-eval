@@ -111,11 +111,15 @@ def compute_ate(
         with_scale:      estimate scale during alignment
 
     Returns:
-        dict with keys: mean, rmse, median, std, max
+        dict with keys: mean, rmse, median, std, max, scale
+        scale: the Umeyama scale factor s (1.0 when align=False or with_scale=False).
+               VGGT outputs normalised-scene-unit scale, not metric; s converts
+               VGGT units → GT metric units.  s ≈ 1 means VGGT scale matches GT.
     """
     pred_c = _camera_centers(pred_extrinsics)
     gt_c   = _camera_centers(gt_extrinsics)
 
+    s = 1.0
     if align:
         R, t, s = align_trajectories_umeyama(pred_c, gt_c, with_scale)
         pred_c  = s * (R @ pred_c.T).T + t
@@ -127,6 +131,7 @@ def compute_ate(
         "median": float(np.median(errors)),
         "std":    float(np.std(errors)),
         "max":    float(np.max(errors)),
+        "scale":  float(s),
     }
 
 
@@ -216,8 +221,74 @@ def compute_rotation_errors(
 
 
 # ---------------------------------------------------------------------------
-# AUC @ multiple thresholds (as used in VGGT paper)
+# AUC @ multiple thresholds — VGGT paper protocol (pairwise relative poses)
 # ---------------------------------------------------------------------------
+
+def compute_relative_pose_auc(
+    pred_extrinsics: np.ndarray,
+    gt_extrinsics:   np.ndarray,
+    thresholds_deg:  List[float] = (5, 10, 20, 30),
+) -> Dict[str, float]:
+    """
+    Pairwise Relative Pose AUC following the VGGT paper protocol.
+
+    For every ordered pair (i, j) with i < j:
+      - Relative Rotation Accuracy (RRA): geodesic angle between relative
+        rotation matrices R_rel_pred and R_rel_gt.
+      - Relative Translation Accuracy (RTA): angular error between the
+        relative translation direction vectors t_rel_pred and t_rel_gt.
+      - Per-pair error = max(RRA, RTA)  (both must be under threshold).
+
+    AUC@θ = area under the accuracy-vs-threshold curve up to θ degrees,
+    normalised to [0, 1].  Matches the AUC@30 reported in the VGGT paper.
+
+    Returns:
+        dict: auc@Xdeg for each threshold, and per-threshold acc@Xdeg.
+    """
+    N = len(pred_extrinsics)
+    pair_errors: List[float] = []
+
+    for i in range(N):
+        for j in range(i + 1, N):
+            # Relative rotation error
+            R_rel_pred = pred_extrinsics[j, :3, :3] @ pred_extrinsics[i, :3, :3].T
+            R_rel_gt   = gt_extrinsics[j,   :3, :3] @ gt_extrinsics[i,   :3, :3].T
+            R_err      = R_rel_pred @ R_rel_gt.T
+            rot_err    = _rotation_angle_deg(R_err)
+
+            # Relative translation direction error (angular, scale-invariant)
+            t_pred = pred_extrinsics[j, :3, 3] - pred_extrinsics[i, :3, 3]
+            t_gt   = gt_extrinsics[j,   :3, 3] - gt_extrinsics[i,   :3, 3]
+            n_pred = np.linalg.norm(t_pred)
+            n_gt   = np.linalg.norm(t_gt)
+            if n_pred < 1e-8 or n_gt < 1e-8:
+                trans_err = 180.0
+            else:
+                cos_a = float(np.clip(np.dot(t_pred / n_pred, t_gt / n_gt), -1.0, 1.0))
+                trans_err = float(np.degrees(np.arccos(cos_a)))
+
+            pair_errors.append(max(rot_err, trans_err))
+
+    pair_errors_arr = np.array(pair_errors)
+    result: Dict[str, float] = {}
+    _trapz = getattr(np, "trapezoid", None) or np.trapz
+
+    # Per-threshold accuracy
+    thresholds_arr = np.array(thresholds_deg, dtype=float)
+    fracs = []
+    for thresh in thresholds_deg:
+        frac = float(np.mean(pair_errors_arr < thresh))
+        result[f"acc@{int(thresh)}deg"] = frac
+        fracs.append(frac)
+
+    # AUC normalised per threshold (one value per threshold ceiling)
+    for thresh, frac_list in zip(thresholds_deg,
+                                  [fracs[:k+1] for k in range(len(fracs))]):
+        xs = thresholds_arr[:len(frac_list)]
+        result[f"auc@{int(thresh)}deg"] = float(_trapz(frac_list, xs) / thresh)
+
+    return result
+
 
 def compute_auc(
     pred_extrinsics: np.ndarray,
@@ -226,12 +297,8 @@ def compute_auc(
     align: bool = True,
 ) -> Dict[str, float]:
     """
-    AUC of the fraction of rotation errors below each threshold.
-    Also returns per-threshold accuracy.
-
-    Returns:
-        dict: auc (area under curve, normalised to [0,1]),
-              acc@Xdeg for each threshold
+    AUC of per-frame absolute rotation errors (legacy helper).
+    Use compute_relative_pose_auc for the paper-faithful pairwise metric.
     """
     rot_errors = []
     for pred, gt in zip(pred_extrinsics, gt_extrinsics):
@@ -247,9 +314,8 @@ def compute_auc(
         result[f"acc@{thresh}deg"] = frac
         fracs.append(frac)
 
-    # Trapezoidal AUC normalised by max threshold
     thresholds_arr = np.array(thresholds_deg, dtype=float)
-    _trapz = getattr(np, "trapezoid", None) or np.trapz  # NumPy ≥2.0 renamed trapz
+    _trapz = getattr(np, "trapezoid", None) or np.trapz
     result["auc"] = float(_trapz(fracs, thresholds_arr) / thresholds_arr[-1])
     return result
 

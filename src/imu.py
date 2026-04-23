@@ -245,11 +245,13 @@ def interpolate_groundtruth(
         q = q / np.linalg.norm(q)
 
         R = quat_to_R(q)
-        # world-to-body extrinsic: E = [R | -R @ p]
-        # (body frame is the IMU/camera body; p is position in world)
+        # world-to-body extrinsic: E = [R_bw | -R_bw @ p]
+        # R_bw = R^T  (q encodes body-to-world rotation R_wb, so R_bw = R_wb^T = R^T)
+        # p is the body position in world; -R_bw @ p is the standard extrinsic translation
         E = np.zeros((3, 4))
-        E[:3, :3] = R.T        # world-to-body rotation
-        E[:3,  3] = p          # position in world frame
+        R_bw = R.T
+        E[:3, :3] = R_bw
+        E[:3,  3] = -R_bw @ p
         extrinsics.append(E)
 
     return np.stack(extrinsics)
