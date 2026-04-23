@@ -186,7 +186,7 @@ class ResolutionSweeper:
                 rr.ate_median = ate["median"]
                 rr.rpe_trans  = rpe["trans_mean"]
                 rr.rpe_rot    = rpe["rot_mean"]
-                rr.rot_mean   = float(np.mean(rot["errors_deg"]))
+                rr.rot_mean   = rot["mean"]
 
             results.append(rr)
             print(
@@ -255,7 +255,7 @@ class ResolutionSweeper:
                 rr.ate_median = ate["median"]
                 rr.rpe_trans  = rpe["trans_mean"]
                 rr.rpe_rot    = rpe["rot_mean"]
-                rr.rot_mean   = float(np.mean(rot["errors_deg"]))
+                rr.rot_mean   = rot["mean"]
 
             results.append(rr)
             try:
