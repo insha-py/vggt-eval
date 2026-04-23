@@ -67,13 +67,25 @@ class ResolutionSweeper:
     store_extrinsics : bool
         If True, each ResolutionResult keeps the raw (N,3,4) extrinsics array
         so callers can do further analysis.  Increases memory usage.
+    chunk_size : int or None
+        If set, use sliding-window processing instead of a single VGGT pass.
+        Recommended: 8 (safe at all resolutions on a T4 16 GB GPU).
+        Allows running 40+ frames without OOM at the cost of Procrustes
+        alignment error between chunks.
+    overlap : int
+        Overlap frames between adjacent chunks (only used when chunk_size
+        is set).  Minimum 2; 3 gives good alignment.
 
     Example
     -------
+    # Single-pass (20 frames, no OOM risk):
     sweeper = ResolutionSweeper()
+
+    # Sliding-window (40 frames, OOM-safe at all resolutions):
+    sweeper = ResolutionSweeper(chunk_size=8, overlap=3)
+
     sweeper.load_model()
-    results = sweeper.run(image_dir="path/to/frames/",
-                          gt_extrinsics=gt)          # gt optional
+    results = sweeper.run(image_dir="path/to/frames/", gt_extrinsics=gt)
     df = sweeper.to_dataframe(results)
     """
 
@@ -82,10 +94,16 @@ class ResolutionSweeper:
         resolutions: List[int] = DEFAULT_RESOLUTIONS,
         conf_thresh: float = 5.0,
         store_extrinsics: bool = False,
+        chunk_size: Optional[int] = None,
+        overlap: int = 3,
     ):
+        if chunk_size is not None and chunk_size <= overlap:
+            raise ValueError("chunk_size must be greater than overlap")
         self.resolutions      = resolutions
         self.conf_thresh      = conf_thresh
         self.store_extrinsics = store_extrinsics
+        self.chunk_size       = chunk_size
+        self.overlap          = overlap
         self._model           = None
         self._device          = None
         self._dtype           = None
@@ -151,27 +169,26 @@ class ResolutionSweeper:
         results: List[ResolutionResult] = []
 
         for res in self.resolutions:
-            print(f"[ResolutionSweeper] resolution={res}px  ({len(paths)} frames)")
-
-            # Load images at this resolution
-            imgs, _, _ = load_images_from_dir(
-                image_dir, target_size=res, max_frames=max_frames
-            )
+            print(f"[ResolutionSweeper] resolution={res}px  ({len(paths)} frames)"
+                  + (f"  [chunked: size={self.chunk_size} overlap={self.overlap}]"
+                     if self.chunk_size else ""))
 
             with MemoryProfiler() as mem, Timer() as tmr:
-                out = run_vggt_inference(
-                    self._model, imgs, self._device, self._dtype, resolution=res
-                )
-
-            # Extract only what we need as numpy, then free everything else
-            ext  = out["extrinsic"]               # (N, 3, 4) numpy
-            conf = out["depth_conf"]              # (N, H, W) numpy
-            conf_mean = float(np.mean(conf))
-
-            del imgs, out, conf
-            gc.collect()
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
+                if self.chunk_size:
+                    ext, conf_mean = self._run_chunked(paths, res)
+                else:
+                    imgs, _, _ = load_images_from_dir(
+                        image_dir, target_size=res, max_frames=max_frames
+                    )
+                    out = run_vggt_inference(
+                        self._model, imgs, self._device, self._dtype, resolution=res
+                    )
+                    ext       = out["extrinsic"]
+                    conf_mean = float(np.mean(out["depth_conf"]))
+                    del imgs, out
+                    gc.collect()
+                    if torch.cuda.is_available():
+                        torch.cuda.empty_cache()
 
             rr = ResolutionResult(
                 resolution      = res,
@@ -205,6 +222,63 @@ class ResolutionSweeper:
             )
 
         return results
+
+    # ------------------------------------------------------------------
+    def _run_chunked(
+        self,
+        paths: list,
+        resolution: int,
+    ) -> tuple:
+        """
+        Run VGGT in sliding-window chunks at `resolution` px and stitch
+        poses with Procrustes alignment on the overlap frames.
+
+        Returns (extrinsics (N,3,4), mean_depth_conf float).
+        """
+        import gc
+        import torch
+        from src.pipeline  import load_images_from_list, run_vggt_inference
+        from src.chunking  import align_chunk_to_reference
+
+        step   = self.chunk_size - self.overlap
+        starts = list(range(0, len(paths), step))
+        pairs  = [(s, min(s + self.chunk_size, len(paths))) for s in starts]
+        pairs  = [(s, e) for s, e in pairs if (e - s) > self.overlap]
+
+        frame_extrs: Dict[int, np.ndarray] = {}
+        conf_acc = 0.0
+
+        for ci, (s, e) in enumerate(pairs):
+            chunk_paths = paths[s:e]
+            imgs, _ = load_images_from_list(chunk_paths, target_size=resolution)
+
+            out = run_vggt_inference(
+                self._model, imgs, self._device, self._dtype, resolution=resolution
+            )
+            ext  = out["extrinsic"]        # (K, 3, 4)
+            conf = float(np.mean(out["depth_conf"]))
+            conf_acc += conf * len(chunk_paths)
+
+            if ci == 0:
+                for local_i, global_i in enumerate(range(s, e)):
+                    frame_extrs[global_i] = ext[local_i]
+            else:
+                ref_ov = np.stack([frame_extrs[i] for i in range(s, s + self.overlap)])
+                aligned, _, info = align_chunk_to_reference(
+                    ref_ov, ext[:self.overlap],
+                    ext, np.zeros((0, 3)),
+                )
+                print(f"    chunk {ci}: align residual={info['residual_m']:.4f} m")
+                for local_i, global_i in enumerate(range(s, e)):
+                    frame_extrs[global_i] = aligned[local_i]
+
+            del imgs, out, ext
+            gc.collect()
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+        combined = np.stack([frame_extrs[i] for i in range(len(paths))])
+        return combined, conf_acc / len(paths)
 
     # ------------------------------------------------------------------
     def run_from_tensors(
