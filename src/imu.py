@@ -438,3 +438,78 @@ def estimate_gyro_bias(
     if not stationary:
         return np.zeros(3)
     return np.mean([r.gyro for r in stationary], axis=0)
+
+
+# ---------------------------------------------------------------------------
+# IMU-guided frame selection
+# ---------------------------------------------------------------------------
+
+def select_frames_by_rotation(
+    imu_readings: List[IMUReading],
+    timestamps: List[float],
+    theta_min_deg: float = 5.0,
+    gyro_bias: Optional[np.ndarray] = None,
+    max_frames: Optional[int] = None,
+) -> List[int]:
+    """
+    Select frame indices from `timestamps` based on accumulated gyroscope
+    rotation since the last selected frame.
+
+    A new frame is accepted whenever cumulative rotation from the gyroscope
+    since the last accepted frame reaches `theta_min_deg`.  This ensures
+    every accepted frame represents a meaningfully distinct viewpoint, which
+    is more informative for VGGT than uniform time-based sampling.
+
+    Args:
+        imu_readings  : all IMU readings for the sequence, sorted by time
+        timestamps    : candidate frame timestamps in seconds (length N)
+        theta_min_deg : rotation threshold in degrees to trigger selection
+        gyro_bias     : (3,) gyro bias to subtract; None → zeros
+        max_frames    : hard cap on selected frame count (None = unlimited)
+
+    Returns:
+        Sorted list of selected indices into `timestamps`.
+        Always includes index 0.
+    """
+    if not timestamps:
+        return []
+
+    bias         = gyro_bias if gyro_bias is not None else np.zeros(3)
+    theta_min    = float(np.radians(theta_min_deg))
+    imu_ts       = np.array([r.timestamp for r in imu_readings])
+
+    selected     = [0]
+    cumulative_R = np.eye(3)
+    last_ts      = timestamps[0]
+
+    for i in range(1, len(timestamps)):
+        t  = timestamps[i]
+        lo = int(np.searchsorted(imu_ts, last_ts, side="left"))
+        hi = int(np.searchsorted(imu_ts, t,       side="right"))
+
+        prev_t    = last_ts
+        prev_gyro = None
+
+        for r in imu_readings[lo:hi]:
+            if r.timestamp < last_ts:
+                continue
+            curr_gyro = r.gyro - bias
+            dt = r.timestamp - prev_t
+            if dt <= 0 or prev_gyro is None:
+                prev_t    = r.timestamp
+                prev_gyro = curr_gyro
+                continue
+            mid_gyro     = 0.5 * (prev_gyro + curr_gyro)
+            cumulative_R = cumulative_R @ so3_exp(mid_gyro * dt)
+            prev_t       = r.timestamp
+            prev_gyro    = curr_gyro
+
+        angle = float(np.linalg.norm(so3_log(cumulative_R)))
+        if angle >= theta_min:
+            selected.append(i)
+            cumulative_R = np.eye(3)
+            last_ts      = t
+            if max_frames is not None and len(selected) >= max_frames:
+                break
+
+    return selected
