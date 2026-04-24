@@ -36,6 +36,9 @@ checkpoints/
 tmp_vggt_inspect/
 vggt_tmp/
 
+# Local-only docs (not for public repo)
+THESIS_FINDINGS.md
+
 # Misc
 tmp_file.py
 .DS_Store
