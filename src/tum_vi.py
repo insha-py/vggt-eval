@@ -253,33 +253,33 @@ class TUMVIDataset:
         Two-phase targeted scan:
 
         Phase 1 — start window (0–16 MB):
-            Always contains cam0 images and cam0/data.csv.
+            Always contains the first cam0 images and cam0/data.csv.
 
-        Phase 2 — CSV search (58–70% of archive, 16 MB steps):
-            TUM-VI archives are ordered cam0 (~500 MB) → cam1 (~500 MB)
-            → imu0/data.csv + mocap0/data.csv (~1 MB) → events0 (~600 MB).
-            For a 1628 MB archive the CSVs sit at ~1000 MB (≈ 61%).
-            We scan 16 MB windows stepping through 58–70% until both
-            missing CSVs are found.  Worst case: 8 extra windows (128 MB)
-            instead of downloading the full archive.
+        Phase 2 — parallel CSV search (from 16 MB onward, up to 500 MB):
+            TUM-VI archives are ordered cam0 (~100 MB) → cam1 (~100 MB)
+            → imu0/data.csv + mocap0/data.csv → events0 (~1.4 GB).
+            CSVs sit at ~200 MB (≈ 12%), not at 58–70% as previously
+            assumed.  We submit 32 MB windows to a thread pool and stop
+            as soon as both CSVs are found — typically 1–2 parallel
+            round-trips instead of 7 sequential ones.
+
+        Final step: parallel Range fetches for each individual file.
         """
-        chunk_b = self._SCAN_CHUNK_MB * 1024 * 1024
-        members: Dict[str, Tuple[int, int]] = {}
+        from concurrent.futures import ThreadPoolExecutor, as_completed
 
-        def _scan_window(start: int, label: str) -> None:
-            end = min(start + chunk_b, total_size) - 1
-            if end <= start:
-                return
-            print(f"[TUM-VI]   {label}  [{start//1024**2}–{end//1024**2} MB] …",
-                  end=" ", flush=True)
-            chunk = _http_range(self._url, start, end)
-            found = _scan_chunk(chunk, start)
-            members.update(found)
-            print(f"{len(found)} entries")
+        chunk_b = self._SCAN_CHUNK_MB * 1024 * 1024   # 16 MB  — Phase 1
+        scan_b  = 32 * 1024 * 1024                     # 32 MB  — Phase 2 windows
+        members: Dict[str, Tuple[int, int]] = {}
 
         # ── Phase 1: start of archive ─────────────────────────────────
         print(f"[TUM-VI] Scanning {total_size / 1024**2:.0f} MB archive …")
-        _scan_window(0, "Phase 1 (start)")
+        p1_end = min(chunk_b, total_size) - 1
+        print(f"[TUM-VI]   Phase 1  [0–{p1_end//1024**2} MB] …",
+              end=" ", flush=True)
+        p1_data = _http_range(self._url, 0, p1_end)
+        found   = _scan_chunk(p1_data, 0)
+        members.update(found)
+        print(f"{len(found)} entries")
 
         images_found = [
             (n, o, s) for n, (o, s) in members.items()
@@ -289,25 +289,44 @@ class TUMVIDataset:
             print("[TUM-VI]   No cam0 images in first 16 MB — unexpected layout.")
             return False
 
-        # ── Phase 2: targeted CSV search around 58–70% ───────────────
+        # ── Phase 2: parallel window scan from Phase-1 end onward ─────
         need_csvs = {self.imu_csv, self.mocap_csv} - {
             self._output_path(n) for n in members
         }
         if need_csvs:
-            print(f"[TUM-VI]   CSVs missing: {[p.name for p in need_csvs]}. "
-                  f"Searching 58–70% of archive …")
-            # Step through 16 MB windows; stop as soon as all CSVs found.
-            start_frac, end_frac, step = 0.58, 0.70, chunk_b
-            offset = int(total_size * start_frac / 512) * 512
-            limit  = int(total_size * end_frac)
-            win_idx = 1
-            while offset < limit and need_csvs:
-                _scan_window(offset, f"Phase 2 win {win_idx}")
-                need_csvs = {self.imu_csv, self.mocap_csv} - {
-                    self._output_path(n) for n in members
-                }
-                offset += step
-                win_idx += 1
+            # Search from 16 MB to min(total, 516 MB).
+            # CSVs follow cam0+cam1 images (~200 MB total), so this covers
+            # all known TUM-VI archive layouts with headroom to spare.
+            search_end = min(total_size, chunk_b + 500 * 1024 * 1024)
+            offsets    = list(range(chunk_b, search_end, scan_b))
+            print(f"[TUM-VI]   Phase 2 (parallel): {len(offsets)} × "
+                  f"{scan_b // 1024**2} MB windows, max_workers=6 …")
+
+            def _fetch_scan(start: int) -> Tuple[int, Dict]:
+                end  = min(start + scan_b, total_size) - 1
+                data = _http_range(self._url, start, end)
+                return start, _scan_chunk(data, start)
+
+            with ThreadPoolExecutor(max_workers=6) as pool:
+                futures = {pool.submit(_fetch_scan, off): off for off in offsets}
+                for fut in as_completed(futures):
+                    try:
+                        start, win_found = fut.result()
+                        members.update(win_found)
+                    except Exception as e:
+                        print(f"\n[TUM-VI]   window {futures[fut]//1024**2} MB failed: {e}")
+                        continue
+                    need_csvs = {self.imu_csv, self.mocap_csv} - {
+                        self._output_path(n) for n in members
+                    }
+                    mb_lo = start // 1024**2
+                    mb_hi = min(start + scan_b, total_size) // 1024**2
+                    print(f"[TUM-VI]   [{mb_lo}–{mb_hi} MB] {len(win_found)} entries  "
+                          f"still need: {[p.name for p in need_csvs] or 'none ✓'}")
+                    if not need_csvs:
+                        for f in futures:
+                            f.cancel()
+                        break
 
         print(f"[TUM-VI]   Found {len(members)} entries total.")
 
@@ -324,8 +343,7 @@ class TUMVIDataset:
         ]
 
         if not images:
-            print("[TUM-VI]   No cam0 images found in first chunk — "
-                  "try increasing _SCAN_CHUNK_MB.")
+            print("[TUM-VI]   No cam0 images found — try increasing _SCAN_CHUNK_MB.")
             return False
         if len(csvs) < 3:
             missing = {self.cam0_csv, self.imu_csv, self.mocap_csv} - {
@@ -334,27 +352,33 @@ class TUMVIDataset:
             print(f"[TUM-VI]   Only {len(csvs)}/3 CSVs found. Missing: {missing}")
             return False
 
-        # ---- Download each file with canonical output path -----------
+        # ---- Parallel download of individual files -------------------
         needed      = csvs + images
         total_bytes = sum(sz for _, _, sz in needed)
         print(f"[TUM-VI]   Downloading {len(needed)} files "
-              f"({total_bytes / 1024**2:.1f} MB) …")
+              f"({total_bytes / 1024**2:.1f} MB) in parallel …")
 
-        for i, (name, offset, size) in enumerate(needed):
+        for (name, _, _) in needed:
             out = self._output_path(name)
-            if out is None:
-                continue
-            out.parent.mkdir(parents=True, exist_ok=True)
+            if out:
+                out.parent.mkdir(parents=True, exist_ok=True)
 
-            if out.exists() and out.stat().st_size == size:
-                continue
-
+        def _fetch_file(item: Tuple) -> Tuple:
+            name, offset, size = item
+            out = self._output_path(name)
+            if out is None or (out.exists() and out.stat().st_size == size):
+                return name, 0
             data = _http_range(self._url, offset, offset + size - 1)
             out.write_bytes(data)
+            return name, size
 
-            mb_so_far = sum(needed[j][2] for j in range(i + 1)) / 1024**2
-            print(f"\r[TUM-VI]   {i+1}/{len(needed)}  ({mb_so_far:.1f} MB)",
-                  end="", flush=True)
+        downloaded = 0
+        with ThreadPoolExecutor(max_workers=8) as pool:
+            for name, size in pool.map(_fetch_file, needed):
+                downloaded += size
+                print(f"\r[TUM-VI]   {downloaded / 1024**2:.1f} / "
+                      f"{total_bytes / 1024**2:.1f} MB",
+                      end="", flush=True)
 
         print(f"\n[TUM-VI] Done — {len(images)} images + {len(csvs)} CSVs saved.")
         return True
