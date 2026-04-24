@@ -1,4 +1,4 @@
-# VGGT Evaluation — Undergraduate Thesis
+# VGGT Evaluation 
 
 **Evaluating VGGT (Visual Geometry Grounded Transformer) for real-world deployment:**
 resolution sensitivity, metric scale recovery, and IMU-guided compute reduction.
